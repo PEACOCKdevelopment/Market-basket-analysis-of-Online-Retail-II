@@ -1,0 +1,354 @@
+﻿---
+title: "Market-basket analysis - Online Retail II"
+author: "Tymoteusz Pawełczyk"
+date: "2026-02-01"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    theme: readable
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  collapse = TRUE,
+  comment = "#>",
+  fig.width  = 10,
+  fig.height = 6,
+  fig.align  = "center"
+)
+
+required <- c("readxl", "dplyr", "stringr", "lubridate", "arules", "arulesViz")
+missing  <- required[!sapply(required, requireNamespace, quietly = TRUE)]
+if (length(missing))
+  stop("Install missing packages: ", paste(missing, collapse = ", "))
+
+library(readxl); library(dplyr); library(stringr); library(lubridate)
+library(arules);  library(arulesViz)
+
+set.seed(42)
+
+# ── Mining parameters - single source of truth ────────────────────────────────
+SUPP_FIS     <- 0.010
+SUPP_RULES   <- 0.005
+CONF_RULES   <- 0.20
+LIFT_MIN     <- 1.50
+MAXLEN_FIS   <- 3L
+MAXLEN_RULES <- 4L
+MIN_BASKET   <- 2L
+
+SUPP_ACT   <- 0.015
+CONF_ACT   <- 0.30
+LIFT_LO    <- 1.50
+LIFT_HI    <- 15.0
+DROP_TERMS <- c("POSTAGE", "DOTCOM", "CARRIAGE")
+```
+
+## Introduction
+
+This report presents a complete, end-to-end implementation of association rules mining applied to the **Online Retail II** dataset. The source data are stored at invoice-line level, where each row represents a single product occurrence within an invoice rather than a market basket directly.
+
+For mining, invoices are transformed into binary baskets. The key methodological choice is to build baskets from **StockCode**, which is a more stable product identifier than free-text descriptions. Canonical descriptions are reattached only for readability in the final outputs. Single-item invoices are also removed, because they cannot generate association rules and would otherwise dilute support estimates.
+
+In addition to standard basket-size profiling, the report includes a light temporal profile by month and day of week. This is not sequential pattern mining, but it provides context for seasonality and helps interpret why some supports are structurally higher in specific periods.
+
+The analysis focuses on discovering frequent itemsets and association rules that capture systematic purchasing relationships. To evaluate the strength and relevance of the extracted rules, we rely on three standard metrics:
+
+- **Support** - the proportion of all transactions containing both the LHS and RHS of a rule.
+- **Confidence** - $P(\text{RHS} \mid \text{LHS})$; the conditional probability of the RHS given the LHS.
+- **Lift** - $\text{Confidence} / P(\text{RHS})$; values above 1 indicate a positive association beyond baseline item frequency.
+
+### Dataset
+
+The **Online Retail II** dataset is publicly available from the UCI Machine Learning Repository. It contains transactional data from a UK-based online retailer selling unique all-occasion giftware, covering all invoice-line transactions recorded between **01/12/2009 and 09/12/2011**.
+
+Data source: <https://archive.ics.uci.edu/dataset/352/online+retail>
+
+## Load and clean
+
+We keep only completed sales lines: drop missing invoice or product description, keep positive quantities, and remove credit notes / returns (invoices starting with "C"). Product descriptions are uppercased and whitespace-normalised to stabilise reporting labels, while **StockCode** is retained as the primary product identifier used later for basket construction. `InvoiceDate` is preserved for temporal profiling.
+
+```{r clean}
+raw <- read_excel("online_retail_II.xlsx")
+
+df <- raw %>%
+  filter(
+    !is.na(Invoice),
+    !is.na(Description),
+    Quantity > 0,
+    !str_detect(as.character(Invoice), "^C")
+  ) %>%
+  mutate(
+    Invoice       = as.character(Invoice),
+    StockCode     = as.character(StockCode),
+    Description   = str_squish(str_to_upper(Description)),
+    `Customer ID` = as.integer(`Customer ID`),
+    Country       = as.character(Country)
+  ) %>%
+  select(Invoice, StockCode, Description, Quantity, InvoiceDate, Price,
+         `Customer ID`, Country)
+
+saveRDS(df, file.path("data", "online_retail_clean.rds"))
+
+cat(sprintf("Rows: %d  |  Invoices: %d  |  Items: %d\n",
+            nrow(df), n_distinct(df$Invoice), n_distinct(df$Description)))
+```
+
+## Data profile
+
+### Top items by line frequency
+
+```{r profile-items}
+df %>% count(Description, sort = TRUE) %>% slice_head(n = 20)
+```
+
+The top-20 frequency table reveals strong demand concentration. Items such as **WHITE HANGING HEART T-LIGHT HOLDER** or **REGENCY CAKESTAND 3 TIER** appear in thousands of invoice lines. Rules involving globally popular items - especially on the RHS - can achieve high confidence even without strong conditional dependence, reinforcing the importance of interpreting confidence jointly with lift.
+
+### Invoice-size distribution
+
+```{r profile-invoices}
+df %>%
+  count(Invoice, name = "n") %>%
+  summarise(mean = mean(n), median = median(n),
+            p90  = quantile(n, .9), p99 = quantile(n, .99))
+```
+
+The distribution has a heavy right tail: a small number of very large invoices can generate a disproportionate number of co-occurrences and inflate higher-order patterns. This motivates the `maxlen` constraints and conservative support thresholds used in the mining stage.
+
+### Temporal profile
+
+```{r profile-time}
+monthly_profile <- df %>%
+  mutate(month = format(InvoiceDate, "%Y-%m")) %>%
+  distinct(Invoice, month) %>%
+  count(month, name = "n_invoices") %>%
+  arrange(month)
+
+weekday_profile <- df %>%
+  mutate(weekday = wday(InvoiceDate, label = TRUE, week_start = 1)) %>%
+  distinct(Invoice, weekday) %>%
+  count(weekday, name = "n_invoices")
+
+monthly_profile
+weekday_profile
+```
+
+Monthly invoice counts provide a quick check for holiday concentration and broader demand regimes, while weekday counts expose the retailer's operating rhythm. This matters because support is not purely a product property; it is partly shaped by when the store is active and how concentrated demand is across the calendar.
+
+## Build transactions
+
+Association rules operate on binary baskets: an item is either present or absent in an invoice, regardless of quantity. We therefore de-duplicate `(Invoice, StockCode)` pairs before building the transaction matrix. `StockCode` gives a stable item identity, while descriptions are mapped back afterwards to keep the report readable. We also discard baskets with fewer than `r MIN_BASKET` items, because they cannot contribute to rule mining.
+
+```{r transactions}
+item_labels <- df %>%
+  count(StockCode, Description, sort = TRUE) %>%
+  distinct(StockCode, .keep_all = TRUE) %>%
+  select(StockCode, Description)
+
+# Only substitute description when it maps to exactly one StockCode;
+# shared descriptions (e.g. product variants) keep the StockCode as label.
+unique_descs <- item_labels %>%
+  count(Description) %>%
+  filter(n == 1) %>%
+  pull(Description)
+
+item_labels <- item_labels %>%
+  mutate(label = if_else(Description %in% unique_descs, Description, StockCode))
+
+baskets <- df %>%
+  distinct(Invoice, StockCode) %>%
+  group_by(Invoice) %>%
+  summarise(items = list(StockCode), .groups = "drop")
+
+trans <- as(baskets$items, "transactions")
+label_map         <- setNames(item_labels$label, item_labels$StockCode)
+current_labels    <- itemLabels(trans)
+itemLabels(trans) <- label_map[current_labels]
+trans             <- trans[size(trans) >= MIN_BASKET]
+
+saveRDS(trans, file.path("data", "online_retail_transactions.rds"))
+
+summary(trans)
+```
+
+The resulting transaction matrix remains highly sparse, which is typical for retail data. Most potential item combinations never occur, so strong rules are rare by construction. Filtering out single-item baskets removes observations that add no rule information while slightly improving the interpretability of support.
+
+### Item frequencies
+
+```{r item-freq-plot}
+itemFrequencyPlot(trans, topN = 20, type = "absolute")
+```
+
+This plot shows the most frequent items by transaction count (true support counts). Very frequent items can dominate high-confidence rules (many baskets contain them), which is why lift is essential for interpreting rule quality.
+
+## Mine frequent itemsets and rules
+
+### Frequent itemsets - Apriori vs Eclat
+
+Both algorithms use the same thresholds (`supp =` `r SUPP_FIS`, `maxlen =` `r MAXLEN_FIS`). In this report, Apriori and Eclat are used as an internal consistency check rather than as two separate analytical outputs: matching counts confirm that the discovered frequent itemsets do not depend on the implementation.
+
+```{r itemsets}
+fis_apriori <- apriori(trans, parameter = list(
+  target = "frequent itemsets", supp = SUPP_FIS, maxlen = MAXLEN_FIS
+))
+
+fis_eclat <- eclat(trans, parameter = list(
+  supp = SUPP_FIS, maxlen = MAXLEN_FIS
+))
+
+cat(sprintf("Itemsets - Apriori: %d  |  Eclat: %d\n",
+            length(fis_apriori), length(fis_eclat)))
+
+stopifnot(length(fis_apriori) == length(fis_eclat))
+
+inspect(head(sort(fis_apriori, by = "support"), 20))
+```
+
+### Association rules
+
+For rules we use a lower support threshold (`r SUPP_RULES`) to capture less frequent cross-sell patterns. After mining we retain only rules with lift at least `r LIFT_MIN`, which removes near-random co-occurrences and keeps only materially positive associations. Redundant rules are then removed so that the final rule set is not inflated by longer antecedents expressing the same signal.
+
+```{r rules}
+rules_raw <- apriori(trans, parameter = list(
+  supp = SUPP_RULES, conf = CONF_RULES, minlen = 2L, maxlen = MAXLEN_RULES
+))
+
+rules <- rules_raw[quality(rules_raw)$lift >= LIFT_MIN]
+rules <- rules[!is.redundant(rules)]
+
+cat(sprintf("Rules raw: %d  |  After filtering: %d\n",
+            length(rules_raw), length(rules)))
+
+saveRDS(fis_apriori, file.path("data", "fis_apriori.rds"))
+saveRDS(fis_eclat,   file.path("data", "fis_eclat.rds"))
+saveRDS(rules,       file.path("data", "rules_final.rds"))
+```
+
+### Top rules by lift and confidence
+
+```{r rules-inspect}
+cat("Top 20 by lift:\n")
+inspect(head(sort(rules, by = "lift"), 20))
+
+cat("\nTop 20 by confidence:\n")
+inspect(head(sort(rules, by = "confidence"), 20))
+```
+
+Top rules by lift expose tightly coupled product pairs (e.g. complementary tools, matched seasonal decorations). High-lift rules are niche in absolute frequency but exceptionally strong in relative terms and well-suited for targeted recommendations. High-confidence rules that also carry high lift are analytically reliable - the pattern is not driven purely by a popular RHS item.
+
+## Curation - reporting-oriented views
+
+At this stage the rules are already filtered for minimum lift and non-redundancy. To make the output presentation-friendly we focus on rules with a single-item RHS, which are the easiest to communicate and deploy. We then produce three views: highest-lift bundles, highest-confidence predictors, and cross-sell candidates with meaningful commercial scale.
+
+```{r curation}
+rules_rhs1 <- rules[size(rhs(rules)) == 1]
+q          <- quality(rules_rhs1)
+
+rules_bundle <- head(sort(rules_rhs1, by = "lift"),       30)
+rules_conf   <- head(sort(rules_rhs1, by = "confidence"), 30)
+rules_xsell  <- rules_rhs1[q$support >= 0.01 & q$lift >= 2] %>%
+  sort(by = "lift") %>%
+  head(30)
+
+write.csv(as(rules_bundle, "data.frame"), file.path("data", "rules_top_lift.csv"),       row.names = FALSE)
+write.csv(as(rules_conf,   "data.frame"), file.path("data", "rules_top_confidence.csv"), row.names = FALSE)
+write.csv(as(rules_xsell,  "data.frame"), file.path("data", "rules_cross_sell.csv"),     row.names = FALSE)
+
+cat(sprintf("Single-RHS rules: %d\n", length(rules_rhs1)))
+```
+
+```{r curation-inspect}
+cat("Top 10 by lift:\n");       inspect(head(rules_bundle, 10))
+cat("\nTop 10 by confidence:\n"); inspect(head(rules_conf,   10))
+cat("\nTop 10 cross-sell (supp ≥ 0.01, lift ≥ 2):\n"); inspect(head(rules_xsell, 10))
+```
+
+**How to read a rule row:**  
+`support` - fraction of all invoices containing both LHS and RHS;  
+`confidence` - how often RHS occurs when LHS is present;  
+`lift` - strength relative to random co-occurrence. A cross-sell support threshold (≥ 1%) ensures the pattern occurs at non-trivial scale.
+
+## Actionable shortlist
+
+For a compact, deployment-ready rule set we restrict attention to short antecedents (≤ 2 items), keep a single-item RHS, remove operational artifacts (shipping / fees), and enforce balanced support / confidence / lift thresholds. The objective is to avoid both ultra-rare niche bundles and rules that are statistically strong only because they point to globally popular items.
+
+```{r actionable}
+rules_act <- rules[
+  size(lhs(rules)) <= 2 &
+  size(rhs(rules)) == 1
+]
+rules_act <- rules_act[!(lhs(rules_act) %pin% DROP_TERMS)]
+rules_act <- rules_act[!(rhs(rules_act) %pin% DROP_TERMS)]
+
+q_act     <- quality(rules_act)
+rules_act <- rules_act[
+  q_act$support    >= SUPP_ACT &
+  q_act$confidence >= CONF_ACT &
+  q_act$lift       >= LIFT_LO  &
+  q_act$lift       <= LIFT_HI
+]
+
+rules_top50 <- head(sort(rules_act, by = "lift"), 50)
+
+cat(sprintf("Actionable candidate rules: %d\n", length(rules_act)))
+
+write.csv(as(rules_top50, "data.frame"), file.path("data", "rules_actionable_top50.csv"), row.names = FALSE)
+saveRDS(rules_top50, file.path("data", "rules_actionable_top50.rds"))
+```
+
+```{r actionable-inspect}
+inspect(head(rules_top50, 20))
+```
+
+The shortlist balances non-trivial support with high relative strength (lift bounded below by `r LIFT_LO` and above by `r LIFT_HI`). The upper lift cap removes variant-completion patterns such as tightly matched sets or product variants sold together, which are statistically strong but often weak from a recommendation-design perspective.
+
+## Visualization
+
+### Support vs Confidence - global rule space
+
+```{r viz-scatter}
+plot(rules_top50,
+     measure = c("support", "confidence"),
+     shading = "lift")
+```
+
+Most rules cluster at low support values, with the highest-lift rules appearing as isolated points. This is consistent with the empirical structure of retail baskets: strong associations tend to be localized, and the lift shading highlights rules that are genuinely stronger than baseline item popularity would predict.
+
+### Network graph - top 20 rules by lift
+
+```{r viz-graph}
+set.seed(42)
+rules_net <- head(sort(rules_top50, by = "lift"), 20)
+plot(rules_net, method = "graph", engine = "htmlwidget")
+```
+
+The graph reveals product clusters (e.g. tightly coupled variants and seasonal bundles) and highlights hub items that frequently appear as RHS. A fixed seed is used so the force-directed layout remains stable across renders, which makes side-by-side comparison and review easier. Such hubs represent natural anchor products for recommendation placement and bundle pricing strategies.
+
+## Summary
+
+Purchasing behaviour in the Online Retail II dataset is strongly structured rather than random. By using `StockCode` as the underlying item identifier, excluding one-item baskets, profiling temporal concentration, and applying stricter lift-based filtering, the analysis is less exposed to noise from description variants, inactive baskets, and near-random co-occurrences. The resulting rule sets are therefore more interpretable, more robust, and closer to what could plausibly support recommendation, bundling, or merchandising decisions.
+
+## Reproducibility Appendix
+
+```{r reproducibility, echo=TRUE}
+required_pkgs <- c("readxl", "dplyr", "stringr", "lubridate", "arules", "arulesViz")
+
+pkg_versions <- tibble::tibble(
+  package = c("R", required_pkgs),
+  version = c(
+    as.character(getRversion()),
+    vapply(required_pkgs, function(p) as.character(packageVersion(p)), character(1))
+  )
+)
+
+knitr::kable(pkg_versions, caption = "R and package versions used in this run")
+```
+
+```{r session-info}
+sessionInfo()
+```
